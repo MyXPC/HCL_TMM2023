@@ -731,17 +731,17 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         file.write('best test acc: {}'.format(max_val_acc_concat))
 
 
+if __name__=="__main__":
+    start_time = time.time()
+    train(nb_epoch=args.epochs,             # number of epoch
+            batch_size=args.bs,         # batch size
+            store_name=args.save_dir,     # folder for output
+            start_epoch=0,         # the start epoch
+    )       
 
-start_time = time.time()
-train(nb_epoch=args.epochs,             # number of epoch
-         batch_size=args.bs,         # batch size
-         store_name=args.save_dir,     # folder for output
-         start_epoch=0,         # the start epoch
-)       
-
-print('--------------------------------------------')
-print('total time: {:.1f}h'.format((time.time()-start_time)/3600))
+    print('--------------------------------------------')
+    print('total time: {:.1f}h'.format((time.time()-start_time)/3600))
 
 
-with open(args.save_dir + '/HCL_test.txt', 'a') as file:
-    file.write('\ntotal time: {:.1f}h'.format((time.time()-start_time)/3600))
+    with open(args.save_dir + '/HCL_test.txt', 'a') as file:
+        file.write('\ntotal time: {:.1f}h'.format((time.time()-start_time)/3600))
