@@ -1,17 +1,28 @@
 """
-Copy from https://github.com/DeepVoltaire/AutoAugment/blob/master/autoaugment.py
+自动数据增强策略 - 从https://github.com/DeepVoltaire/AutoAugment/blob/master/autoaugment.py复制
+实现了多种自动数据增强策略，包括ImageNet、CIFAR10和SVHN数据集的增强策略
 """
 
-from PIL import Image, ImageEnhance, ImageOps
-import numpy as np
-import random
+from PIL import Image, ImageEnhance, ImageOps  # 导入PIL图像处理模块
+import numpy as np  # 导入NumPy数值计算库
+import random  # 导入随机数模块
 
-__all__ = ['AutoAugImageNetPolicy', 'AutoAugCIFAR10Policy', 'AutoAugSVHNPolicy']
+__all__ = ['AutoAugImageNetPolicy', 'AutoAugCIFAR10Policy', 'AutoAugSVHNPolicy']  # 导出的类列表
 
 
 class AutoAugImageNetPolicy(object):
+    """ImageNet自动数据增强策略
+    
+    包含25种专门为ImageNet数据集设计的增强策略组合
+    """
     def __init__(self, fillcolor=(128, 128, 128)):
+        """初始化ImageNet增强策略
+        
+        Args:
+            fillcolor: 填充颜色，用于某些变换操作
+        """
         self.policies = [
+            # 25种增强策略组合，每个SubPolicy包含两个操作及其概率和强度
             SubPolicy(0.4, "posterize", 8, 0.6, "rotate", 9, fillcolor),
             SubPolicy(0.6, "solarize", 5, 0.6, "autocontrast", 5, fillcolor),
             SubPolicy(0.8, "equalize", 8, 0.6, "equalize", 3, fillcolor),
@@ -43,10 +54,19 @@ class AutoAugImageNetPolicy(object):
         ]
 
     def __call__(self, img):
-        policy_idx = random.randint(0, len(self.policies) - 1)
-        return self.policies[policy_idx](img)
+        """应用随机选择的增强策略
+        
+        Args:
+            img: 输入图像
+            
+        Returns:
+            PIL.Image: 增强后的图像
+        """
+        policy_idx = random.randint(0, len(self.policies) - 1)  # 随机选择策略
+        return self.policies[policy_idx](img)  # 应用选择的策略
 
     def __repr__(self):
+        """返回策略描述"""
         return "AutoAugment ImageNet Policy"
 
 
@@ -143,7 +163,7 @@ class SubPolicy(object):
             "translateY": np.linspace(0, 150 / 331, 10),
             "rotate": np.linspace(0, 30, 10),
             "color": np.linspace(0.0, 0.9, 10),
-            "posterize": np.round(np.linspace(8, 4, 10), 0).astype(np.int),
+            "posterize": np.round(np.linspace(8, 4, 10), 0).astype(int),
             "solarize": np.linspace(256, 0, 10),
             "contrast": np.linspace(0.0, 0.9, 10),
             "sharpness": np.linspace(0.0, 0.9, 10),

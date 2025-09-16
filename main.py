@@ -65,10 +65,11 @@ parser.add_argument('--epochs',  type=int, default=100, help='训练总轮数')
 parser.add_argument('--each_class',  default=None, type=int,help='每个类别的样本数量')
 parser.add_argument('--bs',  type=int, default=30,help='批次大小')
 parser.add_argument('--net',  type=str, default='resnet50', help='网络架构: resnet50, resnet101, resnet152')
-parser.add_argument('--data',  type=str, default='bird',help='数据集类型: bird, aircraft, car')
+parser.add_argument('--data',  type=str, default=None,help='数据集路径')#必填
+parser.add_argument('--val',  type=str, default=None,help='测试集路径')#必填
 parser.add_argument('--gpu', default='0,1', type=str, help='使用的GPU编号')
 parser.add_argument('--gpus', default=None, type=int, help='使用的GPU卡数量')
-parser.add_argument('--save_dir',  type=str, default='' ,help='保存目录')
+parser.add_argument('--save_dir',  type=str, default='' ,help='保存目录')#必填
 parser.add_argument("--num_workers", default=4, type=int, help='数据加载工作进程数')
 parser.add_argument('--pretrained_model1', default=None, type=str, help='从断点加载网络1')
 parser.add_argument('--pretrained_model2', default=None, type=str, help='从断点加载网络2')
@@ -83,7 +84,6 @@ args = parser.parse_args()
 gpu = args.gpu
 args.gpus = len(gpu.split(','))
 print(args.gpu, '使用的GPU卡数量:', args.gpus)
-args.save_dir = args.data + '_net_{}'.format(args.net)+ args.save_dir  # 设置保存目录
 
 
 
@@ -413,39 +413,45 @@ class HCL_loss(nn.Module):
 
 
 def train(nb_epoch, batch_size, store_name, start_epoch=0):
+    """主训练函数 - 实现分层对比学习(HCL)训练流程
+    
+    该函数负责整个训练过程的组织，包括：
+    1. 数据准备和加载
+    2. 模型初始化
+    3. 优化器设置
+    4. 训练循环
+    5. 验证和模型保存
+    
+    Args:
+        nb_epoch: 总训练轮数
+        batch_size: 批次大小
+        store_name: 结果保存目录
+        start_epoch: 起始训练轮数（用于断点续训）
+    """
     # setup output
-    exp_dir = store_name
+    exp_dir = store_name  # 实验输出目录
     try:
-        os.stat(exp_dir)
+        os.stat(exp_dir)  # 检查目录是否存在
     except:
-        os.makedirs(exp_dir)
+        os.makedirs(exp_dir)  # 创建输出目录
 
-    use_cuda = torch.cuda.is_available()
+    use_cuda = torch.cuda.is_available()  # 检查CUDA可用性
     print('use cuda:',use_cuda)
 
    
     # Data
     print('==> Preparing data..')
-    if args.data == 'bird':
-        transform_train = transforms.Compose([
+    transform_train = transforms.Compose([
             transforms.Resize((550, 550)),
             transforms.RandomCrop(448, padding=8),
             transforms.RandomHorizontalFlip(),
+            AutoAugImageNetPolicy(),#随机数据增强
             transforms.ToTensor(),
             transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
-        ])
-    else:
-        transform_train = transforms.Compose([
-            transforms.Resize((550, 550)),
-            transforms.RandomCrop(448, padding=8),
-            transforms.RandomHorizontalFlip(),
-            AutoAugImageNetPolicy(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])
-        ])
+    ])
 
 
-    trainset = Imagefolder_modified(root='./data/web-{}/train'.format(args.data), transform=transform_train, number = args.each_class)
+    trainset = Imagefolder_modified(root=args.data, transform=transform_train, number = args.each_class)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,drop_last=True)
     print('train image number is ', len(trainset))
 
@@ -457,7 +463,7 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    testset = Imagefolder_modified(root='./data/web-{}/val'.format(args.data), transform=transform_test, number = args.each_class)
+    testset = Imagefolder_modified(root=args.val, transform=transform_test, number = args.each_class)
     testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers,drop_last=False)
     print('val image number is ', len(testset))
 
@@ -578,113 +584,129 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
 
 
     for epoch in range(start_epoch, nb_epoch):
-
+        """主训练循环 - 每个epoch的训练和验证过程"""
         # print('Epoch: %d' % epoch)
-        start = time.time()
-        net1.train()
-        net2.train()
-        net3.train()
-        saliency_sampler.train()
+        start = time.time()  # 记录epoch开始时间
+        net1.train()  # 设置网络1为训练模式
+        net2.train()  # 设置网络2为训练模式
+        net3.train()  # 设置网络3为训练模式
+        saliency_sampler.train()  # 设置显著性采样器为训练模式
 
+        # 初始化训练统计指标
+        train_loss = 0  # 累计训练损失
+        correct = 0  # 正确预测数量
+        total = 0  # 总样本数量
+        idx = 0  # 批次索引
 
-        train_loss = 0
-        correct = 0
-        total = 0
-        idx = 0
-
-
+        # 训练批次循环
         for batch_idx, (inputs, targets, index) in enumerate(trainloader):
+            idx = batch_idx  # 更新批次索引
 
             if use_cuda:
-                inputs, targets = inputs.cuda(), targets.cuda()
-            inputs, targets = Variable(inputs), Variable(targets)
+                inputs, targets = inputs.cuda(), targets.cuda()  # 将数据移动到GPU
+            inputs, targets = Variable(inputs), Variable(targets)  # 转换为Variable类型
 
-            # update learning rate
+            # 更新学习率 - 使用余弦退火调度
             for nlr in range(len(optimizer.param_groups)):
                 optimizer.param_groups[nlr]['lr'] = cosine_anneal_schedule(epoch, nb_epoch, lr[nlr])
 
-       
+            # 网络1前向传播 - 获取多尺度输出和显著性信息
             output_1_1, output_2_1, output_3_1, output_concat_1, coord, xl_concat1, xl3_ori, xf_ori = net1(inputs, 4)
 
-            
+            # 基于显著性采样生成目标区域图像
             inputs_obj = saliency_sampler(inputs.clone(), xf_ori)
-            coord = coord.detach().cpu()
-            coord = coord.numpy()
-            coord = np.uint8(coord)
-            inputs_salient = inputs.clone()
-            inputs_batch_size = inputs.size(0)
-            for i in range(inputs_batch_size):
-                a,b,c,d = coord[i]
-                saliency_figure = inputs[i,:,:,:].clone()
-                show = saliency_figure[:,32*b:32*(b+d),32*a:32*(a+c)]
-                show = show.unsqueeze(0)
-                show = F.interpolate(show, size=[448,448], mode='bilinear', align_corners=True)
-                show=show.squeeze(0)
-
-                inputs_salient[i,:,:,:] = show
             
+            # 处理坐标信息用于显著性区域提取
+            coord = coord.detach().cpu()  # 分离梯度并移动到CPU
+            coord = coord.numpy()  # 转换为numpy数组
+            coord = np.uint8(coord)  # 转换为无符号8位整数
+            inputs_salient = inputs.clone()  # 克隆输入图像
+            inputs_batch_size = inputs.size(0)  # 获取批次大小
+            
+            # 对每个样本提取显著性区域
+            for i in range(inputs_batch_size):
+                a,b,c,d = coord[i]  # 获取边界框坐标(x,y,width,height)
+                print(a,b,c,d)
+                saliency_figure = inputs[i,:,:,:].clone()  # 克隆当前样本图像
+                # 提取显著性区域（32倍下采样坐标映射）
+                print(saliency_figure.shape)
+                show = saliency_figure[:,32*b:32*(b+d),32*a:32*(a+c)]
+                print(saliency_figure[:,32*b:32*(b+d),32*a:32*(a+c)].shape)
+                show = show.unsqueeze(0)  # 添加批次维度
+                # 插值回原始尺寸
+                show = F.interpolate(show, size=[448,448], mode='bilinear', align_corners=True)
+                show=show.squeeze(0)  # 移除批次维度
+                inputs_salient[i,:,:,:] = show  # 替换为显著性区域图像
 
+            # 网络2前向传播 - 处理目标区域图像
             output_1_2, output_2_2, output_3_2, output_concat_2, _ , xl_concat2, xl3_obj, _ = net2(inputs_obj, 4)
 
-
-            inputs_part, _  = jigsaw_generator(inputs_salient, 2)
+            # 生成拼图图像用于网络3
+            inputs_part, _  = jigsaw_generator(inputs_salient, 2)  # 2x2拼图
+            # 网络3前向传播 - 处理拼图图像
             output_1_3, output_2_3, output_3_3, output_concat_3, _ , xl_concat3, xl3_part, _ = net3(inputs_part, 4)
 
-
+            # 计算分层对比学习损失
             loss = HclLoss(output_1_1,output_1_2, output_2_1, output_2_2,output_3_1,output_3_2,output_concat_1,output_concat_2, targets, epoch, index, 
             output_1_3, output_2_3, output_3_3, output_concat_3, xl_concat1, xl_concat2, xl_concat3, xl3_ori, xl3_obj, xl3_part, xf_ori)                 
 
+            # 反向传播和优化
+            optimizer.zero_grad()  # 清空梯度
+            loss.backward()  # 反向传播计算梯度
+            optimizer.step()  # 更新参数
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-
-            #  training log
-            _, predicted1 = torch.max(output_concat_1.data, 1)
-            _, predicted2 = torch.max(output_concat_2.data, 1)
-            _, predicted3 = torch.max(output_concat_3.data, 1)
-            total += targets.size(0)
+            # 训练日志记录 - 计算准确率
+            _, predicted1 = torch.max(output_concat_1.data, 1)  # 网络1预测结果
+            _, predicted2 = torch.max(output_concat_2.data, 1)  # 网络2预测结果
+            _, predicted3 = torch.max(output_concat_3.data, 1)  # 网络3预测结果
+            total += targets.size(0)  # 累计样本数量
+            # 计算三个网络的平均正确预测数
             correct += (predicted1.eq(targets.data).cpu().sum() + predicted2.eq(targets.data).cpu().sum() + predicted3.eq(targets.data).cpu().sum())/3.
-            train_loss += loss.item()
+            train_loss += loss.item()  # 累计损失
 
+        # 计算epoch训练准确率
         train_acc = 100. * float(correct) / total
 
+        # 写入训练结果到文件
         with open(exp_dir + '/HCL_results_train.txt', 'a') as file:
             file.write(
                 'Iteration %d | train_acc = %.5f | train_loss = %.5f |\n' % (
                 epoch, train_acc, train_loss/ (idx + 1) ))
 
-
+        # 验证阶段 - 每5个epoch或在特定条件下执行
         if epoch < 10 or epoch%5==0 or epoch>nb_epoch-20:
-            net1.eval()
-            net2.eval()
-            net3.eval()
-            saliency_sampler.eval()
+            net1.eval()  # 设置网络1为评估模式
+            net2.eval()  # 设置网络2为评估模式
+            net3.eval()  # 设置网络3为评估模式
+            saliency_sampler.eval()  # 设置显著性采样器为评估模式
 
-
+            # 初始化验证准确率计量器
             topconcat_val = AverageMeter()
 
+            total = 0  # 重置总样本数
+            idx = 0  # 重置批次索引
 
-            total = 0
-            idx = 0
-
-
+            # 禁用梯度计算进行验证
             with torch.no_grad():
                 for batch_idx, (inputs, targets, _) in enumerate(testloader):
-                    idx = batch_idx
+                    idx = batch_idx  # 更新批次索引
                     if use_cuda:
-                        inputs, targets = inputs.cuda(), targets.cuda()
+                        inputs, targets = inputs.cuda(), targets.cuda()  # 移动到GPU
 
+                    # 网络1验证前向传播
                     output_1_1, output_2_1, output_3_1, output_concat_1, coord, _, _ , xf_ori  = net1(inputs, 4)
 
+                    # 生成目标区域图像用于验证
                     inputs_obj = saliency_sampler(inputs.clone(), xf_ori)
 
+                    # 处理坐标信息
                     coord = coord.detach().cpu()
                     coord = coord.numpy()
                     coord = np.uint8(coord)
                     inputs_salient = inputs.clone()
                     inputs_batch_size = inputs.size(0)
+                    
+                    # 提取每个样本的显著性区域
                     for i in range(inputs_batch_size):
                         a,b,c,d = coord[i]
                         saliency_figure = inputs[i,:,:,:].clone()
@@ -692,46 +714,49 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
                         show = show.unsqueeze(0)
                         show = F.interpolate(show, size=[448,448], mode='bilinear', align_corners=True)
                         show=show.squeeze(0)
-
                         inputs_salient[i,:,:,:] = show
 
+                    # 网络2验证前向传播
                     output_1_2, output_2_2, output_3_2, output_concat_2, _, _, _, _ = net2(inputs_obj, 4)
 
+                    # 网络3验证前向传播（直接使用显著性区域，不生成拼图）
                     output_1_3, output_2_3, output_3_3, output_concat_3, _, _ , _, _ = net3(inputs_salient, 4)
 
-
+                    # 融合三个网络的输出进行最终预测
                     outputs_concat = output_concat_1 + output_concat_2 + output_concat_3
-                    prec1 = accuracy(outputs_concat.float().data, targets)[0]
-                    topconcat_val.update(prec1.item(), inputs.size(0))
+                    prec1 = accuracy(outputs_concat.float().data, targets)[0]  # 计算top1准确率
+                    topconcat_val.update(prec1.item(), inputs.size(0))  # 更新准确率计量器
 
-
+            # 获取平均验证准确率
             val_acc_concat = topconcat_val.avg
 
-
-
+            # 构建显示参数字符串
             show_param = 'epoch: %d |sum Loss: %.3f | train Acc: %.3f%%  | test Acc: %.3f%% time%.1fmin(%.1fh)\n' % (
                     epoch, train_loss/ (idx + 1),
                     train_acc, val_acc_concat, (time.time()-start)/60, (time.time()-start)*(nb_epoch-epoch-1)/3600 )
                         
-
-
+            # 检查是否为最佳模型
             if val_acc_concat > max_val_acc_concat:
-                max_val_acc_concat = val_acc_concat
+                max_val_acc_concat = val_acc_concat  # 更新最佳准确率
 
-                print('*'+show_param)
+                print('*'+show_param)  # 标记最佳结果
 
+                # 保存最佳模型 - 网络1
                 net1.cpu()
                 torch.save(net1, exp_dir + '/best_total_concat-net1.pth')
                 net1.cuda()
 
+                # 保存最佳模型 - 网络2
                 net2.cpu()
                 torch.save(net2, exp_dir + '/best_total_concat-net2.pth')
                 net2.cuda()
 
+                # 保存最佳模型 - 网络3
                 net3.cpu()
                 torch.save(net3, exp_dir + '/best_total_concat-net3.pth')
                 net3.cuda()
 
+                # 保存最佳显著性采样器
                 saliency_sampler.cpu()
                 torch.save(saliency_sampler, exp_dir + '/best_total_concat-ss.pth')
                 saliency_sampler.cuda()
@@ -739,7 +764,7 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
             else:
                 print(show_param)
 
-
+            # 写入验证结果到文件
             with open(exp_dir + '/HCL_test.txt', 'a') as file:
                 file.write('Iteration %d, test acc = %.5f\n' % (
                 epoch, val_acc_concat))
