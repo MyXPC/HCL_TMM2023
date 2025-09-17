@@ -22,10 +22,16 @@ from tqdm import *
 import warnings
 warnings.filterwarnings('ignore')
 
-from src.ms_layer import *  # 导入多尺度层模块
+from src_ddp.ms_layer import *  # 导入多尺度层模块
 
 from torchvision import transforms
 tensor_to_image = transforms.ToPILImage()  # 张量转图像转换器
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '12355'
 
 ini_seed = 42  # 设置随机种子
 
@@ -46,9 +52,12 @@ def set_seed(seed = ini_seed):
 
 set_seed()  # 初始化随机种子
 
-from src.utils import *  # 导入工具函数
-from src.Imagefolder_modified import Imagefolder_modified  # 导入修改的图像文件夹加载器
-from src.autoaugment import AutoAugImageNetPolicy  # 导入自动数据增强策略
+
+
+
+from src_ddp.utils import *  # 导入工具函数
+from src_ddp.Imagefolder_modified import Imagefolder_modified  # 导入修改的图像文件夹加载器
+from src_ddp.autoaugment import AutoAugImageNetPolicy  # 导入自动数据增强策略
 
 
 
@@ -72,11 +81,39 @@ parser.add_argument('--drop_rate', type=float, default=0.35, help ='丢弃率，
 
 
 
+# 添加DDP相关参数
+parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
+parser.add_argument('--world_size', type=int, default=1, help='number of distributed processes')
+
 # 解析命令行参数
 args = parser.parse_args()
 gpu = args.gpu
 args.gpus = len(gpu.split(','))
 print(args.gpu, '使用的GPU卡数量:', args.gpus)
+
+# DDP初始化
+def setup_ddp():
+    """初始化分布式训练环境"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ['RANK'])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        print('Not using distributed mode')
+        args.distributed = False
+        return
+    
+    args.distributed = True
+    
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=args.world_size,
+        rank=args.rank
+    )
+    dist.barrier()
+    print(f"Initialized distributed training: rank {args.rank}, world size {args.world_size}")
 
 
 
@@ -421,19 +458,27 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         store_name: 结果保存目录
         start_epoch: 起始训练轮数（用于断点续训）
     """
+    # 初始化DDP
+    setup_ddp()
+    
     # setup output
     exp_dir = store_name  # 实验输出目录
-    try:
-        os.stat(exp_dir)  # 检查目录是否存在
-    except:
-        os.makedirs(exp_dir)  # 创建输出目录
+    
+    # 只在rank 0上创建目录
+    if not args.distributed or args.rank == 0:
+        try:
+            os.stat(exp_dir)  # 检查目录是否存在
+        except:
+            os.makedirs(exp_dir)  # 创建输出目录
 
     use_cuda = torch.cuda.is_available()  # 检查CUDA可用性
-    print('use cuda:',use_cuda)
+    if not args.distributed or args.rank == 0:
+        print('use cuda:',use_cuda)
 
    
     # Data
-    print('==> Preparing data..')
+    if not args.distributed or args.rank == 0:
+        print('==> Preparing data..')
     transform_train = transforms.Compose([
             transforms.Resize((550, 550)),
             transforms.RandomCrop(448, padding=8),
@@ -444,9 +489,28 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
     ])
 
 
-    trainset = Imagefolder_modified(root=args.data, transform=transform_train, number = args.each_class,cached=False)#加载至内存
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,drop_last=True)
-    print('train image number is ', len(trainset))
+    trainset = Imagefolder_modified(root=args.data, transform=transform_train, number = args.each_class)
+    
+    # 使用分布式采样器
+    if args.distributed:
+        train_sampler = DistributedSampler(trainset)
+        shuffle = False
+    else:
+        train_sampler = None
+        shuffle = True
+        
+    trainloader = torch.utils.data.DataLoader(
+        trainset, 
+        batch_size=batch_size, 
+        shuffle=shuffle, 
+        num_workers=args.num_workers,
+        drop_last=True,
+        sampler=train_sampler,
+        pin_memory=True
+    )
+    
+    if not args.distributed or args.rank == 0:
+        print('train image number is ', len(trainset))
 
 
     transform_test = transforms.Compose([
@@ -456,9 +520,17 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    testset = Imagefolder_modified(root=args.val, transform=transform_test, number = args.each_class,cached=False)#加载至内存
-    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers,drop_last=False)
-    print('val image number is ', len(testset))
+    testset = Imagefolder_modified(root=args.val, transform=transform_test, number = args.each_class)
+    testloader = torch.utils.data.DataLoader(
+        testset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=args.num_workers,
+        drop_last=False
+    )
+    
+    if not args.distributed or args.rank == 0:
+        print('val image number is ', len(testset))
 
 
 
@@ -483,52 +555,75 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
 
 
 
-    if args.gpus > 1:
+    # 使用DDP包装模型，设置find_unused_parameters=True
+    if args.distributed:
+        net1 = DDP(net1.cuda(), device_ids=[args.local_rank], output_device=args.local_rank,find_unused_parameters=True)
+        net2 = DDP(net2.cuda(), device_ids=[args.local_rank], output_device=args.local_rank,find_unused_parameters=True)
+        net3 = DDP(net3.cuda(), device_ids=[args.local_rank], output_device=args.local_rank,find_unused_parameters=True)
+        saliency_sampler = DDP(saliency_sampler.cuda(), device_ids=[args.local_rank], output_device=args.local_rank)
+    elif args.gpus > 1:
         net1 = torch.nn.DataParallel(net1)
         net2 = torch.nn.DataParallel(net2)
         net3 = torch.nn.DataParallel(net3)
-
-
-
-    net1.cuda()
-    net2.cuda()
-    net3.cuda()
-    saliency_sampler.cuda()
+        net1.cuda()
+        net2.cuda()
+        net3.cuda()
+        saliency_sampler.cuda()
+    else:
+        net1.cuda()
+        net2.cuda()
+        net3.cuda()
+        saliency_sampler.cuda()
 
 
 
     HclLoss = HCL_loss(labels_all=0, Tepoch =10, drop_rate = 0.25, class_num=len(trainset.classes))
-    if args.gpus > 1:
+    
+    # 根据是否使用DDP选择正确的模型引用
+    if args.distributed:
+        net1_ref = net1.module
+        net2_ref = net2.module
+        net3_ref = net3.module
+    elif args.gpus > 1:
+        net1_ref = net1.module
+        net2_ref = net2.module
+        net3_ref = net3.module
+    else:
+        net1_ref = net1
+        net2_ref = net2
+        net3_ref = net3
+        
+    if args.gpus > 1 or args.distributed:
         optimizer = optim.SGD([
-            {'params': net1.module.classifier_concat.parameters(), 'lr': 0.002},
-            {'params': net1.module.conv_block1.parameters(), 'lr': 0.002},
-            {'params': net1.module.classifier1.parameters(), 'lr': 0.002},
-            {'params': net1.module.conv_block2.parameters(), 'lr': 0.002},
-            {'params': net1.module.classifier2.parameters(), 'lr': 0.002},
-            {'params': net1.module.conv_block3.parameters(), 'lr': 0.002},
-            {'params': net1.module.classifier3.parameters(), 'lr': 0.002},
-            {'params': net1.module.features.parameters(), 'lr': 0.0002},
-            {'params': net1.module.conv_block_map.parameters(), 'lr': 0.002},
+            {'params': net1_ref.classifier_concat.parameters(), 'lr': 0.002},
+            {'params': net1_ref.conv_block1.parameters(), 'lr': 0.002},
+            {'params': net1_ref.classifier1.parameters(), 'lr': 0.002},
+            {'params': net1_ref.conv_block2.parameters(), 'lr': 0.002},
+            {'params': net1_ref.classifier2.parameters(), 'lr': 0.002},
+            {'params': net1_ref.conv_block3.parameters(), 'lr': 0.002},
+            {'params': net1_ref.classifier3.parameters(), 'lr': 0.002},
+            {'params': net1_ref.features.parameters(), 'lr': 0.0002},
+            {'params': net1_ref.conv_block_map.parameters(), 'lr': 0.002},
 
-            {'params': net2.module.classifier_concat.parameters(), 'lr': 0.002},
-            {'params': net2.module.conv_block1.parameters(), 'lr': 0.002},
-            {'params': net2.module.classifier1.parameters(), 'lr': 0.002},
-            {'params': net2.module.conv_block2.parameters(), 'lr': 0.002},
-            {'params': net2.module.classifier2.parameters(), 'lr': 0.002},
-            {'params': net2.module.conv_block3.parameters(), 'lr': 0.002},
-            {'params': net2.module.classifier3.parameters(), 'lr': 0.002},
-            {'params': net2.module.features.parameters(), 'lr': 0.0002},
-            {'params': net2.module.conv_block_map.parameters(), 'lr': 0.002},
+            {'params': net2_ref.classifier_concat.parameters(), 'lr': 0.002},
+            {'params': net2_ref.conv_block1.parameters(), 'lr': 0.002},
+            {'params': net2_ref.classifier1.parameters(), 'lr': 0.002},
+            {'params': net2_ref.conv_block2.parameters(), 'lr': 0.002},
+            {'params': net2_ref.classifier2.parameters(), 'lr': 0.002},
+            {'params': net2_ref.conv_block3.parameters(), 'lr': 0.002},
+            {'params': net2_ref.classifier3.parameters(), 'lr': 0.002},
+            {'params': net2_ref.features.parameters(), 'lr': 0.0002},
+            {'params': net2_ref.conv_block_map.parameters(), 'lr': 0.002},
 
-            {'params': net3.module.classifier_concat.parameters(), 'lr': 0.002},
-            {'params': net3.module.conv_block1.parameters(), 'lr': 0.002},
-            {'params': net3.module.classifier1.parameters(), 'lr': 0.002},
-            {'params': net3.module.conv_block2.parameters(), 'lr': 0.002},
-            {'params': net3.module.classifier2.parameters(), 'lr': 0.002},
-            {'params': net3.module.conv_block3.parameters(), 'lr': 0.002},
-            {'params': net3.module.classifier3.parameters(), 'lr': 0.002},
-            {'params': net3.module.features.parameters(), 'lr': 0.0002},
-            {'params': net3.module.conv_block_map.parameters(), 'lr': 0.002},
+            {'params': net3_ref.classifier_concat.parameters(), 'lr': 0.002},
+            {'params': net3_ref.conv_block1.parameters(), 'lr': 0.002},
+            {'params': net3_ref.classifier1.parameters(), 'lr': 0.002},
+            {'params': net3_ref.conv_block2.parameters(), 'lr': 0.002},
+            {'params': net3_ref.classifier2.parameters(), 'lr': 0.002},
+            {'params': net3_ref.conv_block3.parameters(), 'lr': 0.002},
+            {'params': net3_ref.classifier3.parameters(), 'lr': 0.002},
+            {'params': net3_ref.features.parameters(), 'lr': 0.0002},
+            {'params': net3_ref.conv_block_map.parameters(), 'lr': 0.002},
         ], momentum=0.9, weight_decay=1e-5)
     else:
         optimizer = optim.SGD([
@@ -564,10 +659,12 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         ], momentum=0.9, weight_decay=1e-5)
 
     
-    if os.path.exists(exp_dir + '/HCL_results_train.txt'):
-        os.remove(exp_dir + '/HCL_results_train.txt')
-    if os.path.exists(exp_dir + '/HCL_test.txt'):
-        os.remove(exp_dir + '/HCL_test.txt')
+    # 只在rank 0上删除旧的结果文件
+    if not args.distributed or args.rank == 0:
+        if os.path.exists(exp_dir + '/HCL_results_train.txt'):
+            os.remove(exp_dir + '/HCL_results_train.txt')
+        if os.path.exists(exp_dir + '/HCL_test.txt'):
+            os.remove(exp_dir + '/HCL_test.txt')
 
     
     max_val_acc_concat = 0
@@ -591,8 +688,16 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         total = 0  # 总样本数量
         idx = 0  # 批次索引
 
-        # 训练批次循环 - 使用tqdm进度条
-        progress_bar = tqdm(enumerate(trainloader), total=len(trainloader), desc=f'Epoch {epoch}/{nb_epoch}')
+        # 设置分布式采样器的epoch
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
+            
+        # 训练批次循环 - 只在rank 0上显示进度条
+        if not args.distributed or args.rank == 0:
+            progress_bar = tqdm(enumerate(trainloader), total=len(trainloader), desc=f'Epoch {epoch}/{nb_epoch}')
+        else:
+            progress_bar = enumerate(trainloader)
+            
         for batch_idx, (inputs, targets, index) in progress_bar:
             idx = batch_idx  # 更新批次索引
 
@@ -655,20 +760,22 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
             correct += (predicted1.eq(targets.data).cpu().sum() + predicted2.eq(targets.data).cpu().sum() + predicted3.eq(targets.data).cpu().sum())/3.
             train_loss += loss.item()  # 累计损失
             
-            # 更新进度条显示信息
-            progress_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
-                'Acc': f'{100. * float(correct) / total:.2f}%'
-            })
+            # 只在rank 0上更新进度条显示信息
+            if not args.distributed or args.rank == 0:
+                progress_bar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{100. * float(correct) / total:.2f}%'
+                })
 
         # 计算epoch训练准确率
         train_acc = 100. * float(correct) / total
 
-        # 写入训练结果到文件
-        with open(exp_dir + '/HCL_results_train.txt', 'a') as file:
-            file.write(
-                'Iteration %d | train_acc = %.5f | train_loss = %.5f |\n' % (
-                epoch, train_acc, train_loss/ (idx + 1) ))
+        # 只在rank 0上写入训练结果到文件
+        if not args.distributed or args.rank == 0:
+            with open(exp_dir + '/HCL_results_train.txt', 'a') as file:
+                file.write(
+                    'Iteration %d | train_acc = %.5f | train_loss = %.5f |\n' % (
+                    epoch, train_acc, train_loss/ (idx + 1) ))
 
         # 验证阶段 - 每5个epoch或在特定条件下执行
         if epoch < 10 or epoch%5==0 or epoch>nb_epoch-20:
@@ -685,7 +792,13 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
 
             # 禁用梯度计算进行验证
             with torch.no_grad():
-                for batch_idx, (inputs, targets, _) in enumerate(testloader):
+                # 只在rank 0上显示验证进度条
+                if not args.distributed or args.rank == 0:
+                    test_progress_bar = tqdm(enumerate(testloader), total=len(testloader), desc=f'Validation Epoch {epoch}')
+                else:
+                    test_progress_bar = enumerate(testloader)
+                    
+                for batch_idx, (inputs, targets, _) in test_progress_bar:
                     idx = batch_idx  # 更新批次索引
                     if use_cuda:
                         inputs, targets = inputs.cuda(), targets.cuda()  # 移动到GPU
@@ -738,56 +851,61 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
 
                 print('*'+show_param)  # 标记最佳结果
 
-                # 保存最佳模型 - 网络1
-                net1.cpu()
-                torch.save(net1, exp_dir + '/best_total_concat-net1.pth')
-                net1.cuda()
+                # 只在rank 0上保存模型
+                if not args.distributed or args.rank == 0:
+                    # 保存最佳模型 - 网络1
+                    net1.cpu()
+                    torch.save(net1, exp_dir + '/best_total_concat-net1.pth')
+                    net1.cuda()
 
-                # 保存最佳模型 - 网络2
-                net2.cpu()
-                torch.save(net2, exp_dir + '/best_total_concat-net2.pth')
-                net2.cuda()
+                    # 保存最佳模型 - 网络2
+                    net2.cpu()
+                    torch.save(net2, exp_dir + '/best_total_concat-net2.pth')
+                    net2.cuda()
 
-                # 保存最佳模型 - 网络3
-                net3.cpu()
-                torch.save(net3, exp_dir + '/best_total_concat-net3.pth')
-                net3.cuda()
+                    # 保存最佳模型 - 网络3
+                    net3.cpu()
+                    torch.save(net3, exp_dir + '/best_total_concat-net3.pth')
+                    net3.cuda()
 
-                # 保存最佳显著性采样器
-                saliency_sampler.cpu()
-                torch.save(saliency_sampler, exp_dir + '/best_total_concat-ss.pth')
-                saliency_sampler.cuda()
+                    # 保存最佳显著性采样器
+                    saliency_sampler.cpu()
+                    torch.save(saliency_sampler, exp_dir + '/best_total_concat-ss.pth')
+                    saliency_sampler.cuda()
 
             else:
                 print(show_param)
 
-            # 写入验证结果到文件
-            with open(exp_dir + '/HCL_test.txt', 'a') as file:
-                file.write('Iteration %d, test acc = %.5f\n' % (
-                epoch, val_acc_concat))
+            # 只在rank 0上写入验证结果到文件
+            if not args.distributed or args.rank == 0:
+                with open(exp_dir + '/HCL_test.txt', 'a') as file:
+                    file.write('Iteration %d, test acc = %.5f\n' % (
+                    epoch, val_acc_concat))
 
 
     print('--------------------------------------------\n')
 
 
-    print('best test acc: {} '.format(max_val_acc_concat))
+    # 只在rank 0上输出和写入最终结果
+    if not args.distributed or args.rank == 0:
+        print('best test acc: {} '.format(max_val_acc_concat))
 
-
-    with open(exp_dir + '/HCL_test.txt', 'a') as file:
-        file.write('best test acc: {}'.format(max_val_acc_concat))
+        with open(exp_dir + '/HCL_test.txt', 'a') as file:
+            file.write('best test acc: {}'.format(max_val_acc_concat))
 
 
 if __name__=="__main__":
     start_time = time.time()
     train(nb_epoch=args.epochs,             # number of epoch
-            batch_size=args.bs,         # 总batch size
+            batch_size=args.bs,         # 每张卡batch size
             store_name=args.save_dir,     # folder for output
             start_epoch=0,         # the start epoch
     )       
 
-    print('--------------------------------------------')
-    print('total time: {:.1f}h'.format((time.time()-start_time)/3600))
+    # 只在rank 0上输出和写入总时间
+    if not args.distributed or args.rank == 0:
+        print('--------------------------------------------')
+        print('total time: {:.1f}h'.format((time.time()-start_time)/3600))
 
-
-    with open(args.save_dir + '/HCL_test.txt', 'a') as file:
-        file.write('\ntotal time: {:.1f}h'.format((time.time()-start_time)/3600))
+        with open(args.save_dir + '/HCL_test.txt', 'a') as file:
+            file.write('\ntotal time: {:.1f}h'.format((time.time()-start_time)/3600))
