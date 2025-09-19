@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py --bs 30 --net 'resnet50' --data "../../dataset/train400" --val "../../dataset/val400" --save_dir "./runs" --epochs 100 --drop_rate 0.25 --gpu 0,1,2,3 --gpus 4
