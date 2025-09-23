@@ -104,20 +104,45 @@ python infer.py \
 
 ## 注意力可视化命令
 
-### 单张图片注意力可视化
+### 单图片模式（处理单张图像）
 ```bash
 # 对单张图片进行注意力可视化，生成热力图和叠加图
 python attention_visualization.py \
-    --image_path ../HCL_data/test_img/101.White_Pelican.jpg \
+    --input_path ../HCL_data/test_img/101.White_Pelican.jpg \
     --model_dir ../HCL_model/epoch100 \
     --net resnet50 \
     --output_dir ../attention_results \
-    --gpu 0
+    --gpu 0 \
+    --mode single
 ```
 
-### 批量注意力可视化（示例脚本）
+### 文件夹模式（批量处理整个文件夹）
 ```bash
-# 创建批量处理脚本 batch_attention.sh
+# 处理文件夹中的所有图像，保持目录结构
+python attention_visualization.py \
+    --input_path ../HCL_data/test_images \
+    --model_dir ../HCL_model/epoch100 \
+    --net resnet50 \
+    --output_dir ../batch_attention_results \
+    --gpu 0 \
+    --mode folder
+```
+
+### 自动检测模式（推荐）
+```bash
+# 自动检测输入路径类型（文件或文件夹）
+python attention_visualization.py \
+    --input_path ../HCL_data/error_samples_organized \
+    --model_dir ../HCL_model/epoch100 \
+    --net resnet50 \
+    --output_dir ../attention_results \
+    --gpu 0 \
+    --mode auto
+```
+
+### 批量注意力可视化（旧版脚本兼容）
+```bash
+# 创建批量处理脚本 batch_attention.sh（兼容旧版参数）
 #!/bin/bash
 
 MODEL_DIR="path/to/trained/models"
@@ -135,11 +160,12 @@ for img_file in $IMAGE_DIR/*.jpg $IMAGE_DIR/*.png; do
         
         echo "Processing: $img_file"
         python attention_visualization.py \
-            --image_path "$img_file" \
+            --input_path "$img_file" \
             --model_dir "$MODEL_DIR" \
             --net resnet50 \
             --output_dir "$output_dir" \
-            --gpu 0
+            --gpu 0 \
+            --mode single
     fi
 done
 ```
@@ -201,11 +227,15 @@ python organize_error_samples.py \
 - `--continue_epoch`: 从指定轮数继续训练
 
 ### 注意力可视化参数
-- `--image_path`: 输入图像文件路径（必需）
+- `--input_path`: 输入路径（单张图像路径或文件夹路径，必需）
 - `--model_dir`: 训练好的模型目录路径（必需）
 - `--net`: 网络架构（resnet50/resnet101/resnet152，默认：resnet50）
 - `--output_dir`: 输出结果目录（默认：attention_results）
 - `--gpu`: 使用的GPU编号（默认：0）
+- `--mode`: 运行模式（single/文件夹/folder/auto，默认：auto）
+  - `single`: 单图片模式，处理单张图像
+  - `folder`: 文件夹模式，批量处理整个文件夹
+  - `auto`: 自动检测模式，根据输入路径类型自动选择
 
 ## 环境要求
 
@@ -222,7 +252,10 @@ pip install torch torchvision tqdm numpy Pillow
 2. **多卡训练**: 使用DDP命令获得更好的扩展性
 3. **显存不足**: 使用混合精度训练或减小批次大小
 4. **推理部署**: 使用推理命令生成预测结果
-5. **注意力可视化**: 使用注意力可视化命令分析模型关注区域
+5. **注意力可视化**: 
+   - **单张图像分析**: 使用`--mode single`分析单张图像的注意力分布
+   - **批量处理**: 使用`--mode folder`批量处理整个文件夹，保持目录结构
+   - **自动检测**: 使用`--mode auto`让脚本自动检测输入类型
 6. **性能测试**: 使用性能测试命令评估训练速度
 
 ## 常见问题
@@ -237,6 +270,10 @@ pip install torch torchvision tqdm numpy Pillow
 - 2024-01-01: 创建启动命令文档
 - 2024-01-02: 添加参数说明和使用建议
 - 2024-01-03: 添加注意力可视化命令和参数说明
+- 2025-09-23: 更新注意力可视化脚本，支持单图片和文件夹两种输出模式
+  - 新增`--input_path`参数替代`--image_path`
+  - 新增`--mode`参数支持single/folder/auto三种模式
+  - 文件夹模式自动复制目录结构并批量处理
 
 ---
 

@@ -212,14 +212,147 @@ def extract_attention_regions(model, image_tensor, device):
         
         return saliency_map, coord, xf_ori
 
+def copy_directory_structure(src_dir, dst_dir):
+    """复制目录结构（不复制图片文件）
+    
+    Args:
+        src_dir: 源目录路径
+        dst_dir: 目标目录路径
+    """
+    for root, dirs, files in os.walk(src_dir):
+        # 计算相对路径
+        rel_path = os.path.relpath(root, src_dir)
+        dst_path = os.path.join(dst_dir, rel_path)
+        
+        # 创建目标目录
+        os.makedirs(dst_path, exist_ok=True)
+        
+        # 不复制图片文件，只创建目录结构
+        print(f"创建目录: {dst_path}")
+
+def process_single_image(image_path, model, transform, device, output_dir, image_name=None):
+    """处理单张图像并生成注意力可视化结果
+    
+    Args:
+        image_path: 图像文件路径
+        model: 加载的模型
+        transform: 图像变换
+        device: 计算设备
+        output_dir: 输出目录
+        image_name: 图像名称（用于文件夹模式）
+        
+    Returns:
+        bool: 处理是否成功
+    """
+    try:
+        # 加载和预处理图像
+        image_tensor, original_image = load_and_preprocess_image(image_path, transform)
+        
+        # 提取注意力信息
+        saliency_map, coord, xf_ori = extract_attention_regions(model, image_tensor, device)
+        
+        # 确定输出路径
+        if image_name:
+            # 文件夹模式：在输出目录下创建与图片名相同的文件夹
+            image_output_dir = os.path.join(output_dir, image_name)
+            os.makedirs(image_output_dir, exist_ok=True)
+            output_path = os.path.join(image_output_dir, 'attention_visualization.png')
+        else:
+            # 单图片模式：直接在输出目录下保存
+            output_path = os.path.join(output_dir, 'attention_visualization.png')
+        
+        # 可视化注意力
+        visualize_attention(image_tensor, saliency_map, output_path)
+        
+        # 保存原始显著性图
+        saliency_np = saliency_map.squeeze().cpu().numpy()
+        saliency_np = (saliency_np - saliency_np.min()) / (saliency_np.max() - saliency_np.min() + 1e-8)
+        saliency_np = (saliency_np * 255).astype(np.uint8)
+        saliency_image = Image.fromarray(saliency_np)
+        
+        if image_name:
+            saliency_image.save(os.path.join(image_output_dir, 'saliency_map.png'))
+        else:
+            saliency_image.save(os.path.join(output_dir, 'saliency_map.png'))
+        
+        # 保存坐标信息
+        coord_np = coord.squeeze().cpu().numpy()
+        
+        if image_name:
+            np.savetxt(os.path.join(image_output_dir, 'attention_coordinates.txt'), coord_np, fmt='%.2f')
+        else:
+            np.savetxt(os.path.join(output_dir, 'attention_coordinates.txt'), coord_np, fmt='%.2f')
+        
+        # 复制原始图像到输出目录（仅文件夹模式）
+        if image_name:
+            original_image.save(os.path.join(image_output_dir, os.path.basename(image_path)))
+        
+        return True
+        
+    except Exception as e:
+        print(f"处理图像 {image_path} 时出错: {e}")
+        return False
+
+def process_folder(input_folder, model, transform, device, output_dir):
+    """处理文件夹中的所有图像
+    
+    Args:
+        input_folder: 输入文件夹路径
+        model: 加载的模型
+        transform: 图像变换
+        device: 计算设备
+        output_dir: 输出目录
+    """
+    # 支持的图像格式
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
+    
+    # 复制目录结构到输出目录（不复制图片）
+    print("复制目录结构...")
+    copy_directory_structure(input_folder, output_dir)
+    
+    # 遍历所有图像文件
+    processed_count = 0
+    failed_count = 0
+    
+    for root, dirs, files in os.walk(input_folder):
+        for file in files:
+            if any(file.lower().endswith(ext) for ext in image_extensions):
+                image_path = os.path.join(root, file)
+                
+                # 计算相对路径和图像名称
+                rel_path = os.path.relpath(root, input_folder)
+                if rel_path == '.':
+                    image_name = os.path.splitext(file)[0]
+                else:
+                    image_name = os.path.join(rel_path, os.path.splitext(file)[0])
+                
+                print(f"处理图像: {image_path}")
+                
+                # 处理单张图像
+                success = process_single_image(image_path, model, transform, device, output_dir, image_name)
+                
+                if success:
+                    processed_count += 1
+                    print(f"✓ 成功处理: {file}")
+                else:
+                    failed_count += 1
+                    print(f"✗ 处理失败: {file}")
+    
+    print(f"\n处理完成!")
+    print(f"成功处理: {processed_count} 张图像")
+    print(f"处理失败: {failed_count} 张图像")
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='HCL注意力可视化')
-    parser.add_argument('--image_path', type=str, required=True, help='输入图像路径')
+    parser.add_argument('--input_path', type=str, required=True, 
+                       help='输入路径（单张图像路径或文件夹路径）')
     parser.add_argument('--model_dir', type=str, required=True, help='模型目录路径')
     parser.add_argument('--net', type=str, default='resnet50', help='网络架构: resnet50, resnet101, resnet152')
     parser.add_argument('--output_dir', type=str, default='attention_results', help='输出目录')
     parser.add_argument('--gpu', type=str, default='0', help='使用的GPU编号')
+    parser.add_argument('--mode', type=str, choices=['single', 'folder', 'auto'], default='auto',
+                       help='运行模式: single(单图片), folder(文件夹), auto(自动检测)')
     
     args = parser.parse_args()
     
@@ -234,14 +367,20 @@ def main():
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 检查输入图像是否存在
-    if not os.path.exists(args.image_path):
-        print(f"错误: 图像文件 {args.image_path} 不存在")
+    # 检查输入路径是否存在
+    if not os.path.exists(args.input_path):
+        print(f"错误: 输入路径 {args.input_path} 不存在")
         return
     
-    # 加载和预处理图像
-    transform = create_transform()
-    image_tensor, original_image = load_and_preprocess_image(args.image_path, transform)
+    # 自动检测模式
+    if args.mode == 'auto':
+        if os.path.isfile(args.input_path):
+            args.mode = 'single'
+        elif os.path.isdir(args.input_path):
+            args.mode = 'folder'
+        else:
+            print(f"错误: 无法识别输入路径类型: {args.input_path}")
+            return
     
     # 加载模型（使用网络1，因为它处理原始图像并提取显著性信息）
     model_path = os.path.join(args.model_dir, 'best_total_concat-net1.pth')
@@ -252,30 +391,43 @@ def main():
     print("加载模型中...")
     model = load_model(model_path, args.net)
     
-    # 提取注意力信息
-    print("提取注意力信息...")
-    saliency_map, coord, xf_ori = extract_attention_regions(model, image_tensor, device)
+    # 创建图像变换
+    transform = create_transform()
     
-    # 可视化注意力
-    output_path = os.path.join(args.output_dir, 'attention_visualization.png')
-    visualize_attention(image_tensor, saliency_map, output_path)
+    # 根据模式处理输入
+    if args.mode == 'single':
+        print(f"单图片模式: 处理图像 {args.input_path}")
+        
+        # 检查是否为图像文件
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
+        if not any(args.input_path.lower().endswith(ext) for ext in image_extensions):
+            print(f"错误: 输入文件不是支持的图像格式: {args.input_path}")
+            return
+        
+        # 处理单张图像
+        success = process_single_image(args.input_path, model, transform, device, args.output_dir)
+        
+        if success:
+            print("注意力可视化完成！")
+            print(f"结果保存在目录: {args.output_dir}")
+            print(f"- 注意力可视化图: attention_visualization.png")
+            print(f"- 原始显著性图: saliency_map.png")
+            print(f"- 注意力坐标: attention_coordinates.txt")
+        else:
+            print("处理图像失败")
     
-    # 保存原始显著性图
-    saliency_np = saliency_map.squeeze().cpu().numpy()
-    saliency_np = (saliency_np - saliency_np.min()) / (saliency_np.max() - saliency_np.min() + 1e-8)
-    saliency_np = (saliency_np * 255).astype(np.uint8)
-    saliency_image = Image.fromarray(saliency_np)
-    saliency_image.save(os.path.join(args.output_dir, 'saliency_map.png'))
-    
-    # 保存坐标信息
-    coord_np = coord.squeeze().cpu().numpy()
-    np.savetxt(os.path.join(args.output_dir, 'attention_coordinates.txt'), coord_np, fmt='%.2f')
-    
-    print("注意力可视化完成！")
-    print(f"结果保存在目录: {args.output_dir}")
-    print(f"- 注意力可视化图: attention_visualization.png")
-    print(f"- 原始显著性图: saliency_map.png")
-    print(f"- 注意力坐标: attention_coordinates.txt")
+    elif args.mode == 'folder':
+        print(f"文件夹模式: 处理文件夹 {args.input_path}")
+        
+        # 处理文件夹中的所有图像
+        process_folder(args.input_path, model, transform, device, args.output_dir)
+        
+        print(f"\n所有结果保存在目录: {args.output_dir}")
+        print("每个图像的结果保存在对应的子文件夹中，包含:")
+        print("- 注意力可视化图: attention_visualization.png")
+        print("- 原始显著性图: saliency_map.png")
+        print("- 注意力坐标: attention_coordinates.txt")
+        print("- 原始图像文件")
 
 if __name__ == "__main__":
     main()
