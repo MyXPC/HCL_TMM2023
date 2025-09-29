@@ -24,7 +24,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
     --epochs 100 \
     --drop_rate 0.25 \
     --gpu 0,1,2,3 \
-    --gpus 4
+    --gpus 4 \
+    --num_workers 4
 ```
 
 ### 单卡训练
@@ -39,7 +40,8 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
     --epochs 100 \
     --drop_rate 0.25 \
     --gpu 0 \
-    --gpus 1
+    --gpus 1 \
+    --num_workers 4
 ```
 
 ## 分布式训练命令
@@ -47,7 +49,7 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
 ### 使用torch.distributed.launch（推荐方式）
 ```bash
 # 使用4个进程进行DDP训练，批次大小15（每个进程）
-python -m torch.distributed.launch --nproc_per_node=4 --master_port=12355 main_ddp.py \
+python -m torch.distributed.launch --nproc_per_node=4 --master_port=12355 main.py \
     --bs 15 \
     --net 'resnet50' \
     --data "../dataset/train/400" \
@@ -55,21 +57,25 @@ python -m torch.distributed.launch --nproc_per_node=4 --master_port=12355 main_d
     --save_dir "./runs" \
     --epochs 100 \
     --drop_rate 0.25 \
-    --gpu 0,1,2,3
+    --gpu 0,1,2,3 \
+    --use_ddp \
+    --num_workers 4
 ```
 
 ### 使用torchrun（PyTorch 1.9+推荐）
 ```bash
 # 使用torchrun启动DDP训练，批次大小8（每个进程）
-torchrun --nproc_per_node=4 --master_port=12355 main_ddp.py \
+torchrun --nproc_per_node=4 --master_port=12355 main.py \
     --bs 8 \
     --net 'resnet50' \
-    --data "../../dataset/train400" \
-    --val "../../dataset/val400" \
+    --data "../../dataset/web496/train400" \
+    --val "../../dataset/web496/val400" \
     --save_dir "./runs" \
     --epochs 100 \
     --drop_rate 0.25 \
-    --gpu 0,1,2,3
+    --gpu 0,1,2,3 \
+    --use_ddp \
+    --num_workers 4
 ```
 
 ## 混合精度训练命令
@@ -77,16 +83,18 @@ torchrun --nproc_per_node=4 --master_port=12355 main_ddp.py \
 ### AMP混合精度训练
 ```bash
 # 使用混合精度训练，减少显存占用，加快训练速度
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main_amp.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
     --bs 30 \
     --net 'resnet50' \
-    --data "../../dataset/train400" \
+    --data "../dataset/train/400" \
     --val "../../dataset/val400" \
     --save_dir "../HCL_data/runs" \
     --epochs 100 \
     --drop_rate 0.25 \
     --gpu 0,1,2,3 \
-    --gpus 4
+    --gpus 4 \
+    --use_amp \
+    --num_workers 4
 ```
 
 ## 推理命令
@@ -210,7 +218,7 @@ python organize_error_samples.py \
 ## 参数说明
 
 ### 主要参数
-- `--bs`: 批次大小（每个GPU）
+- `--bs`: **每个GPU上的批次大小**（不是总batch size）
 - `--net`: 网络架构（resnet50/resnet101/resnet152/resnet18）
 - `--data`: 训练数据集路径
 - `--val`: 验证数据集路径
@@ -220,11 +228,15 @@ python organize_error_samples.py \
 - `--gpu`: 使用的GPU编号（逗号分隔）
 - `--gpus`: 使用的GPU数量
 
+**DP和DDP模式下的batch_size含义不相同**：在DataParallel（DP）和DistributedDataParallel（DDP）模式下，`--bs`参数分别表示所有GPU上的批次大小和每一个GPU上的批次大小。
+
 ### 高级参数
 - `--each_class`: 每个类别的样本数量（用于限制数据集大小）
-- `--num_workers`: 数据加载工作进程数
+- `--num_workers`: 数据加载工作进程数（默认：4）
 - `--pretrained_model1/2/3`: 从断点加载预训练模型
 - `--continue_epoch`: 从指定轮数继续训练
+- `--use_amp`: 启用混合精度训练（减少显存占用）
+- `--use_ddp`: 启用分布式数据并行训练
 
 ### 注意力可视化参数
 - `--input_path`: 输入路径（单张图像路径或文件夹路径，必需）

@@ -46,72 +46,82 @@ pip install -r requirements.txt
 
 ## 数据集支持
 
-代码支持以下细粒度数据集：
-- **CUB-200-2011** (鸟类数据集)：使用 `--data bird`
-- **FGVC-Aircraft** (飞机数据集)：使用 `--data aircraft`  
-- **Stanford Cars** (汽车数据集)：使用 `--data car`
-
-数据集应按以下结构组织：
+代码支持任意图像分类数据集，数据集应按以下结构组织：
 ```
-data/
-├── web-bird/
-│   ├── train/
-│   │   ├── 类别1/
-│   │   ├── 类别2/
+dataset/
+├── train400/
+│   ├── 类别1/
+│   │   ├── image1.jpg
+│   │   ├── image2.jpg
 │   │   └── ...
-│   └── val/
-│       ├── 类别1/
-│       ├── 类别2/
-│       └── ...
-├── web-aircraft/
-└── web-car/
+│   ├── 类别2/
+│   └── ...
+└── val400/
+    ├── 类别1/
+    ├── 类别2/
+    └── ...
 ```
+
+**注意**: 代码使用 `--data` 和 `--val` 参数指定训练集和验证集路径，支持任意自定义数据集。
 
 ## 使用方法
 
 ### 训练模型
 
-使用提供的shell脚本训练不同数据集：
-
-**CUB-200-2011 (鸟类数据集):**
-```bash
-bash train_cub.sh
-```
-
-**FGVC-Aircraft (飞机数据集):**
-```bash
-bash train_air.sh
-```
-
-**Stanford Cars (汽车数据集):**
-```bash
-bash train_car.sh
-```
-
-### 手动训练
-
-也可以使用自定义参数手动训练：
+使用自定义参数手动训练：
 
 ```bash
 python main.py \
     --bs <批次大小> \
-    --net <resnet50|resnet101|resnet152> \
-    --data <bird|aircraft|car> \
+    --net <resnet50|resnet101|resnet152|resnet18> \
+    --data <训练数据集路径> \
+    --val <验证数据集路径> \
+    --save_dir <模型保存目录> \
     --epochs <训练轮数> \
     --drop_rate <丢弃率> \
-    --gpu <GPU编号>
+    --gpu <GPU编号> \
+    --gpus <GPU数量> \
+    --num_workers <数据加载进程数>
+```
+
+### 示例训练命令
+
+```bash
+# 使用4张GPU训练，resnet50网络
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
+    --bs 30 \
+    --net 'resnet50' \
+    --data "../../dataset/train400" \
+    --val "../../dataset/val400" \
+    --save_dir "./runs" \
+    --epochs 100 \
+    --drop_rate 0.25 \
+    --gpu 0,1,2,3 \
+    --gpus 4 \
+    --num_workers 4
 ```
 
 ### 参数说明
 
-- `--bs`: 批次大小（默认：30）
-- `--net`: 骨干网络架构（resnet50、resnet101、resnet152）
-- `--data`: 数据集类型（bird、aircraft、car）
+- `--bs`: **每个GPU上的批次大小**（不是总batch size，默认：30）
+- `--net`: 骨干网络架构（resnet50、resnet101、resnet152、resnet18）
+- `--data`: 训练数据集路径（必需）
+- `--val`: 验证数据集路径（必需）
+- `--save_dir`: 模型保存目录（必需）
 - `--epochs`: 训练总轮数（默认：100）
 - `--drop_rate`: 丢弃率，控制噪声样本处理（默认：0.35）
-- `--gpu`: 使用的GPU编号（如：0,1）
-- `--each_class`: 每个类别的样本数量（可选）
+- `--gpu`: 使用的GPU编号（逗号分隔，如：0,1）
+- `--gpus`: 使用的GPU数量
+- `--each_class`: 每个类别的样本数量（可选，用于限制数据集大小）
 - `--num_workers`: 数据加载工作进程数（默认：4）
+- `--pretrained_model1/2/3`: 从断点加载预训练模型
+- `--continue_epoch`: 从指定轮数继续训练
+- `--use_amp`: 启用混合精度训练（减少显存占用）
+- `--use_ddp`: 启用分布式数据并行训练
+
+**注意**: `--bs` 参数指定的是每个GPU上的批次大小。总batch size = `--bs` × GPU数量。例如，使用4张GPU且 `--bs 30` 时，总batch size为120。
+
+**DP和DDP模式下的batch_size含义相同**：在DataParallel（DP）和DistributedDataParallel（DDP）模式下，`--bs`参数都表示每个GPU上的批次大小。
 
 ## 项目结构
 
@@ -123,9 +133,13 @@ HCL_TMM2023/
 ├── utils.py             # 工具函数
 ├── autoaugment.py       # 自动数据增强
 ├── Imagefolder_modified.py # 修改的图像数据集加载器
-├── train_cub.sh         # 鸟类数据集训练脚本
-├── train_air.sh         # 飞机数据集训练脚本
-├── train_car.sh         # 汽车数据集训练脚本
+├── infer.py             # 推理脚本
+├── attention_visualization.py # 注意力可视化脚本
+├── check.py             # 预测结果检查脚本
+├── organize_error_samples.py # 错误样本组织脚本
+├── generate_confusion_matrix.py # 混淆矩阵生成脚本
+├── src/                 # 源代码目录
+├── src_ddp/             # 分布式训练源代码目录
 └── README.md           # 项目说明文档
 ```
 

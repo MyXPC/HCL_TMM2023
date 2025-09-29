@@ -2,10 +2,8 @@ from __future__ import print_function
 import os
 import argparse
 import numpy as np
-from PIL import Image
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 允许加载截断的图像文件
-import logging
 import random
 import torch
 import torch.nn as nn
@@ -13,18 +11,19 @@ import torch.nn.functional as F
 import math
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
-import torchvision
 from torchvision import transforms
-from torch.autograd import Variable
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import time
-from tqdm import *
+from tqdm import tqdm
+from torch import amp
 
 import warnings
 warnings.filterwarnings('ignore')
 
 from src.ms_layer import *  # 导入多尺度层模块
 
-from torchvision import transforms
 tensor_to_image = transforms.ToPILImage()  # 张量转图像转换器
 
 ini_seed = 42  # 设置随机种子
@@ -59,7 +58,7 @@ parser.add_argument('--each_class',  default=None, type=int,help='每个类别�
 parser.add_argument('--bs',  type=int, default=30,help='每个GPU上的批次大小')
 parser.add_argument('--net',  type=str, default='resnet50', help='网络架构: resnet50, resnet101, resnet152')
 parser.add_argument('--data',  type=str, default=None,help='数据集路径')#必填
-parser.add_argument('--val',  type=str, default=None,help='测试集路径')#必填
+parser.add_argument('--val',  type=str, default=None,help='测试集路径')#可选，如不提供则跳过验证
 parser.add_argument('--gpu', default='0,1', type=str, help='使用的GPU编号')
 parser.add_argument('--gpus', default=None, type=int, help='使用的GPU卡数量')
 parser.add_argument('--save_dir',  type=str, default='' ,help='保存目录')#必填
@@ -69,6 +68,8 @@ parser.add_argument('--pretrained_model2', default=None, type=str, help='从断�
 parser.add_argument('--pretrained_model3', default=None, type=str, help='从断点加载网络3')
 parser.add_argument('--continue_epoch', default=None, type=int, help='从指定轮数继续训练')
 parser.add_argument('--drop_rate', type=float, default=0.35, help ='丢弃率，控制噪声样本处理')
+parser.add_argument('--use_amp', action='store_true', help='启用混合精度训练')
+parser.add_argument('--use_ddp', action='store_true', help='启用分布式数据并行训练')
 
 
 
@@ -521,6 +522,33 @@ class HCL_loss(nn.Module):
 
         return sloss_sum, H, js, ce_loss
 
+# DDP初始化
+def setup_ddp():
+    """初始化分布式训练环境"""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ['RANK'])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        print('Not using distributed mode')
+        args.distributed = False
+        return
+    
+    args.distributed = True
+    
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=args.world_size,
+        rank=args.rank
+    )
+    dist.barrier()
+    print(f"Initialized distributed training: rank {args.rank}, world size {args.world_size}")
+
 def train(nb_epoch, batch_size, store_name, start_epoch=0):
     """主训练函数 - 实现分层对比学习(HCL)训练流程
     
@@ -537,15 +565,23 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         store_name: 结果保存目录
         start_epoch: 起始训练轮数（用于断点续训）
     """
+    # 初始化DDP
+    if args.use_ddp:
+        setup_ddp()
+    
     # setup output
     exp_dir = store_name  # 实验输出目录
-    try:
-        os.stat(exp_dir)  # 检查目录是否存在
-    except:
-        os.makedirs(exp_dir)  # 创建输出目录
+    
+    # 只在rank 0上创建目录
+    if not args.use_ddp or (args.use_ddp and args.rank == 0):
+        try:
+            os.stat(exp_dir)  # 检查目录是否存在
+        except:
+            os.makedirs(exp_dir)  # 创建输出目录
 
     use_cuda = torch.cuda.is_available()  # 检查CUDA可用性
-    print('use cuda:',use_cuda)
+    if not args.use_ddp or (args.use_ddp and args.rank == 0):
+        print('use cuda:',use_cuda)
 
    
     # Data
@@ -561,20 +597,53 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
 
 
     trainset = Imagefolder_modified(root=args.data, transform=transform_train, number = args.each_class,cached=False)#加载至内存
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,drop_last=True)
-    print('train image number is ', len(trainset))
+    
+    # 使用分布式采样器
+    if args.use_ddp:
+        train_sampler = DistributedSampler(trainset)
+        shuffle = False
+    else:
+        train_sampler = None
+        shuffle = True
+        
+    trainloader = torch.utils.data.DataLoader(
+        trainset, 
+        batch_size=batch_size, 
+        shuffle=shuffle, 
+        num_workers=args.num_workers,
+        drop_last=True,
+        sampler=train_sampler,
+        pin_memory=True
+    )
+    
+    if not args.use_ddp or (args.use_ddp and args.rank == 0):
+        print('train image number is ', len(trainset))
 
 
-    transform_test = transforms.Compose([
-        transforms.Resize((550, 550)),
-        transforms.CenterCrop(448),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    # 检查是否提供验证集路径
+    if args.val is not None:
+        transform_test = transforms.Compose([
+            transforms.Resize((550, 550)),
+            transforms.CenterCrop(448),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-    testset = Imagefolder_modified(root=args.val, transform=transform_test, number = args.each_class,cached=False)#加载至内存
-    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers,drop_last=False)
-    print('val image number is ', len(testset))
+        testset = Imagefolder_modified(root=args.val, transform=transform_test, number = args.each_class,cached=False)#加载至内存
+        testloader = torch.utils.data.DataLoader(
+            testset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=args.num_workers,
+            drop_last=False
+        )
+        
+        if not args.use_ddp or (args.use_ddp and args.rank == 0):
+            print('val image number is ', len(testset))
+    else:
+        testloader = None
+        if not args.use_ddp or (args.use_ddp and args.rank == 0):
+            print('无验证集模式：跳过验证阶段')
 
 
 
@@ -603,17 +672,32 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         net3 = load_ms_layer(model_name='resnet18_ms', classes_nums=len(trainset.classes),pretrain=True, require_grad=True)
         saliency_sampler = Saliency_Sampler()
 
-    if args.gpus > 1:
+    # 使用DDP包装模型，设置find_unused_parameters=True
+    if args.use_ddp:
+        net1 = DDP(net1.cuda(), device_ids=[args.local_rank], output_device=args.local_rank,find_unused_parameters=True)
+        net2 = DDP(net2.cuda(), device_ids=[args.local_rank], output_device=args.local_rank,find_unused_parameters=True)
+        net3 = DDP(net3.cuda(), device_ids=[args.local_rank], output_device=args.local_rank,find_unused_parameters=True)
+        saliency_sampler = DDP(saliency_sampler.cuda(), device_ids=[args.local_rank], output_device=args.local_rank)
+    elif args.gpus > 1:
         net1 = torch.nn.DataParallel(net1)
         net2 = torch.nn.DataParallel(net2)
         net3 = torch.nn.DataParallel(net3)
-
-    net1.cuda()
-    net2.cuda()
-    net3.cuda()
-    saliency_sampler.cuda()
+        net1.cuda()
+        net2.cuda()
+        net3.cuda()
+        saliency_sampler.cuda()
+    else:
+        net1.cuda()
+        net2.cuda()
+        net3.cuda()
+        saliency_sampler.cuda()
 
     HclLoss = HCL_loss(labels_all=0, Tepoch =10, drop_rate = 0.25, class_num=len(trainset.classes))
+    
+    # 创建混合精度训练的GradScaler
+    if args.use_amp:
+        scaler = amp.GradScaler()
+        
     if args.gpus > 1:
         optimizer = optim.SGD([
             {'params': net1.module.classifier_concat.parameters(), 'lr': 0.002},
@@ -704,60 +788,114 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
         total = 0  # 总样本数量
         idx = 0  # 批次索引
 
-        # 训练批次循环 - 使用tqdm进度条
-        progress_bar = tqdm(enumerate(trainloader), total=len(trainloader), desc=f'Epoch {epoch}/{nb_epoch}')
+        # 设置分布式采样器的epoch
+        if args.use_ddp:
+            train_sampler.set_epoch(epoch)
+            
+        # 训练批次循环 - 只在rank 0上显示进度条
+        if not args.use_ddp or (args.use_ddp and args.rank == 0):
+            progress_bar = tqdm(enumerate(trainloader), total=len(trainloader), desc=f'Epoch {epoch}/{nb_epoch}')
+        else:
+            progress_bar = enumerate(trainloader)
+            
         for batch_idx, (inputs, targets, index) in progress_bar:
             idx = batch_idx  # 更新批次索引
 
             if use_cuda:
                 inputs, targets = inputs.cuda(), targets.cuda()  # 将数据移动到GPU
-            inputs, targets = Variable(inputs), Variable(targets)  # 转换为Variable类型
+            # 不再需要Variable，PyTorch 1.0+自动处理梯度计算
 
             # 更新学习率 - 使用余弦退火调度
             for nlr in range(len(optimizer.param_groups)):
                 optimizer.param_groups[nlr]['lr'] = cosine_anneal_schedule(epoch, nb_epoch, lr[nlr])
 
-            # 网络1前向传播 - 获取多尺度输出和显著性信息
-            output_1_1, output_2_1, output_3_1, output_concat_1, coord, xl_concat1, xl3_ori, xf_ori = net1(inputs, 4)
+            # 使用混合精度训练 - 前向传播
+            if args.use_amp:
+                with amp.autocast("cuda"):
+                    # 网络1前向传播 - 获取多尺度输出和显著性信息
+                    output_1_1, output_2_1, output_3_1, output_concat_1, coord, xl_concat1, xl3_ori, xf_ori = net1(inputs, 4)
 
-            # 基于显著性采样生成目标区域图像
-            inputs_obj = saliency_sampler(inputs.clone(), xf_ori)
-            
-            # 处理坐标信息用于显著性区域提取
-            coord = coord.detach().cpu()  # 分离梯度并移动到CPU
-            coord = coord.numpy()  # 转换为numpy数组
-            coord = np.uint8(coord)  # 转换为无符号8位整数
-            inputs_salient = inputs.clone()  # 克隆输入图像
-            inputs_batch_size = inputs.size(0)  # 获取批次大小
-            
-            # 对每个样本提取显著性区域
-            for i in range(inputs_batch_size):
-                a,b,c,d = coord[i]  # 获取边界框坐标(x,y,width,height)
-                saliency_figure = inputs[i,:,:,:].clone()  # 克隆当前样本图像
-                # 提取显著性区域（32倍下采样坐标映射）
-                show = saliency_figure[:,32*b:32*int(b+d),32*a:32*int(a+c)]#使用int将莫名奇妙被转成二进制的的数转成十进制
-                show = show.unsqueeze(0)  # 添加批次维度
-                # 插值回原始尺寸
-                show = F.interpolate(show, size=[448,448], mode='bilinear', align_corners=True)
-                show=show.squeeze(0)  # 移除批次维度
-                inputs_salient[i,:,:,:] = show  # 替换为显著性区域图像
+                    # 基于显著性采样生成目标区域图像
+                    inputs_obj = saliency_sampler(inputs.clone(), xf_ori)
+                    
+                    # 处理坐标信息用于显著性区域提取
+                    coord = coord.detach().cpu()  # 分离梯度并移动到CPU
+                    coord = coord.numpy()  # 转换为numpy数组
+                    coord = np.uint8(coord)  # 转换为无符号8位整数
+                    inputs_salient = inputs.clone()  # 克隆输入图像
+                    inputs_batch_size = inputs.size(0)  # 获取批次大小
+                    
+                    # 对每个样本提取显著性区域
+                    for i in range(inputs_batch_size):
+                        a,b,c,d = coord[i]  # 获取边界框坐标(x,y,width,height)
+                        saliency_figure = inputs[i,:,:,:].clone()  # 克隆当前样本图像
+                        # 提取显著性区域（32倍下采样坐标映射）
+                        show = saliency_figure[:,32*b:32*int(b+d),32*a:32*int(a+c)]#使用int将莫名奇妙被转成二进制的的数转成十进制
+                        show = show.unsqueeze(0)  # 添加批次维度
+                        # 插值回原始尺寸
+                        show = F.interpolate(show, size=[448,448], mode='bilinear', align_corners=True)
+                        show=show.squeeze(0)  # 移除批次维度
+                        inputs_salient[i,:,:,:] = show  # 替换为显著性区域图像
 
-            # 网络2前向传播 - 处理目标区域图像
-            output_1_2, output_2_2, output_3_2, output_concat_2, _ , xl_concat2, xl3_obj, _ = net2(inputs_obj, 4)
+                    # 网络2前向传播 - 处理目标区域图像
+                    output_1_2, output_2_2, output_3_2, output_concat_2, _ , xl_concat2, xl3_obj, _ = net2(inputs_obj, 4)
 
-            # 生成拼图图像用于网络3
-            inputs_part, _  = jigsaw_generator(inputs_salient, 2)  # 2x2拼图
-            # 网络3前向传播 - 处理拼图图像
-            output_1_3, output_2_3, output_3_3, output_concat_3, _ , xl_concat3, xl3_part, _ = net3(inputs_part, 4)
+                    # 生成拼图图像用于网络3
+                    inputs_part, _  = jigsaw_generator(inputs_salient, 2)  # 2x2拼图
+                    # 网络3前向传播 - 处理拼图图像
+                    output_1_3, output_2_3, output_3_3, output_concat_3, _ , xl_concat3, xl3_part, _ = net3(inputs_part, 4)
 
-            # 计算分层对比学习损失
-            loss = HclLoss(output_1_1,output_1_2, output_2_1, output_2_2,output_3_1,output_3_2,output_concat_1,output_concat_2, targets, epoch, index, 
-            output_1_3, output_2_3, output_3_3, output_concat_3, xl_concat1, xl_concat2, xl_concat3, xl3_ori, xl3_obj, xl3_part, xf_ori)                 
+                    # 计算分层对比学习损失
+                    loss = HclLoss(output_1_1,output_1_2, output_2_1, output_2_2,output_3_1,output_3_2,output_concat_1,output_concat_2, targets, epoch, index, 
+                    output_1_3, output_2_3, output_3_3, output_concat_3, xl_concat1, xl_concat2, xl_concat3, xl3_ori, xl3_obj, xl3_part, xf_ori)                 
 
-            # 反向传播和优化
-            optimizer.zero_grad()  # 清空梯度
-            loss.backward()  # 反向传播计算梯度
-            optimizer.step()  # 更新参数
+                # 反向传播和优化 - 使用混合精度
+                optimizer.zero_grad()  # 清空梯度
+                scaler.scale(loss).backward()  # 缩放损失并反向传播
+                scaler.step(optimizer)  # 更新参数
+                scaler.update()  # 更新scaler状态
+            else:
+                # 网络1前向传播 - 获取多尺度输出和显著性信息
+                output_1_1, output_2_1, output_3_1, output_concat_1, coord, xl_concat1, xl3_ori, xf_ori = net1(inputs, 4)
+
+                # 基于显著性采样生成目标区域图像
+                inputs_obj = saliency_sampler(inputs.clone(), xf_ori)
+                
+                # 处理坐标信息用于显著性区域提取
+                coord = coord.detach().cpu()  # 分离梯度并移动到CPU
+                coord = coord.numpy()  # 转换为numpy数组
+                coord = np.uint8(coord)  # 转换为无符号8位整数
+                inputs_salient = inputs.clone()  # 克隆输入图像
+                inputs_batch_size = inputs.size(0)  # 获取批次大小
+                
+                # 对每个样本提取显著性区域
+                for i in range(inputs_batch_size):
+                    a,b,c,d = coord[i]  # 获取边界框坐标(x,y,width,height)
+                    saliency_figure = inputs[i,:,:,:].clone()  # 克隆当前样本图像
+                    # 提取显著性区域（32倍下采样坐标映射）
+                    show = saliency_figure[:,32*b:32*int(b+d),32*a:32*int(a+c)]#使用int将莫名奇妙被转成二进制的的数转成十进制
+                    show = show.unsqueeze(0)  # 添加批次维度
+                    # 插值回原始尺寸
+                    show = F.interpolate(show, size=[448,448], mode='bilinear', align_corners=True)
+                    show=show.squeeze(0)  # 移除批次维度
+                    inputs_salient[i,:,:,:] = show  # 替换为显著性区域图像
+
+                # 网络2前向传播 - 处理目标区域图像
+                output_1_2, output_2_2, output_3_2, output_concat_2, _ , xl_concat2, xl3_obj, _ = net2(inputs_obj, 4)
+
+                # 生成拼图图像用于网络3
+                inputs_part, _  = jigsaw_generator(inputs_salient, 2)  # 2x2拼图
+                # 网络3前向传播 - 处理拼图图像
+                output_1_3, output_2_3, output_3_3, output_concat_3, _ , xl_concat3, xl3_part, _ = net3(inputs_part, 4)
+
+                # 计算分层对比学习损失
+                loss = HclLoss(output_1_1,output_1_2, output_2_1, output_2_2,output_3_1,output_3_2,output_concat_1,output_concat_2, targets, epoch, index, 
+                output_1_3, output_2_3, output_3_3, output_concat_3, xl_concat1, xl_concat2, xl_concat3, xl3_ori, xl3_obj, xl3_part, xf_ori)                 
+
+                # 反向传播和优化
+                optimizer.zero_grad()  # 清空梯度
+                loss.backward()  # 反向传播计算梯度
+                optimizer.step()  # 更新参数
 
             # 训练日志记录 - 计算准确率
             _, predicted1 = torch.max(output_concat_1.data, 1)  # 网络1预测结果
@@ -768,11 +906,12 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
             correct += (predicted1.eq(targets.data).cpu().sum() + predicted2.eq(targets.data).cpu().sum() + predicted3.eq(targets.data).cpu().sum())/3.
             train_loss += loss.item()  # 累计损失
             
-            # 更新进度条显示信息
-            progress_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
-                'Acc': f'{100. * float(correct) / total:.2f}%'
-            })
+            # 更新进度条显示信息 - 只在tqdm进度条对象上调用
+            if hasattr(progress_bar, 'set_postfix'):
+                progress_bar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{100. * float(correct) / total:.2f}%'
+                })
 
         # 计算epoch训练准确率
         train_acc = 100. * float(correct) / total
@@ -783,8 +922,8 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
                 'Iteration %d | train_acc = %.5f | train_loss = %.5f |\n' % (
                 epoch, train_acc, train_loss/ (idx + 1) ))
         
-        # 验证阶段 - 每5个epoch或在特定条件下执行
-        if epoch < 10 or epoch%5==0 or epoch>nb_epoch-20:
+        # 验证阶段 - 每5个epoch或在特定条件下执行，仅在提供验证集时执行
+        if (epoch < 10 or epoch%5==0 or epoch>nb_epoch-20) and testloader is not None:
             net1.eval()  # 设置网络1为评估模式
             net2.eval()  # 设置网络2为评估模式
             net3.eval()  # 设置网络3为评估模式
@@ -878,16 +1017,23 @@ def train(nb_epoch, batch_size, store_name, start_epoch=0):
             with open(exp_dir + '/HCL_test.txt', 'a') as file:
                 file.write('Iteration %d, test acc = %.5f\n' % (
                 epoch, val_acc_concat))
+        else:
+            # 无验证集模式，只显示训练信息
+            show_param = 'epoch: %d |sum Loss: %.3f | train Acc: %.3f%% | time%.1fmin(%.1fh)\n' % (
+                    epoch, train_loss/ (idx + 1),
+                    train_acc, (time.time()-start)/60, (time.time()-start)*(nb_epoch-epoch-1)/3600 )
+            print(show_param)
 
 
     print('--------------------------------------------\n')
 
-
-    print('best test acc: {} '.format(max_val_acc_concat))
-
-
-    with open(exp_dir + '/HCL_test.txt', 'a') as file:
-        file.write('best test acc: {}'.format(max_val_acc_concat))
+    # 只在有验证集时显示最佳验证准确率
+    if testloader is not None:
+        print('best test acc: {} '.format(max_val_acc_concat))
+        with open(exp_dir + '/HCL_test.txt', 'a') as file:
+            file.write('best test acc: {}'.format(max_val_acc_concat))
+    else:
+        print('无验证集模式：训练完成')
 
 
 if __name__=="__main__":
